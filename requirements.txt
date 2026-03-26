@@ -1,0 +1,10 @@
+langchain==1.2.13
+langchain-classic==1.0.3
+langchain-community==0.4.1
+langchain-openai==1.1.12
+langchain-core==1.2.22
+openai==2.30.0
+pypdf==6.9.2
+faiss-cpu==1.13.2
+python-dotenv==1.2.2
+tiktoken==0.12.0
