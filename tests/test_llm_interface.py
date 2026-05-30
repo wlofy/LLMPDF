@@ -53,27 +53,47 @@ class TestAnswer:
             iface.answer("What is this?")
 
     def test_returns_result_string(self, llm_interface, vector_store):
-        mock_chain = MagicMock()
-        mock_chain.invoke.return_value = {
-            "result": "Test answer.",
-            "source_documents": _make_docs(["Context chunk."]),
-        }
-        with patch("src.llm_interface.RetrievalQA") as MockQA:
-            MockQA.from_chain_type.return_value = mock_chain
-            result = llm_interface.answer("What is this document about?")
+        vector_store.similarity_search.return_value = _make_docs(["Context chunk."])
+        llm_interface._llm = MagicMock()
+        llm_interface._llm.invoke.return_value = MagicMock(content="Test answer.")
+
+        result = llm_interface.answer("What is this document about?")
 
         assert result["result"] == "Test answer."
         assert len(result["source_documents"]) == 1
 
     def test_retriever_uses_correct_k(self, llm_interface, vector_store):
-        mock_chain = MagicMock()
-        mock_chain.invoke.return_value = {"result": "ok", "source_documents": []}
+        vector_store.similarity_search.return_value = []
+        llm_interface._llm = MagicMock()
+        llm_interface._llm.invoke.return_value = MagicMock(content="ok")
 
-        with patch("src.llm_interface.RetrievalQA") as MockQA:
-            MockQA.from_chain_type.return_value = mock_chain
-            llm_interface.answer("question", k=7)
+        llm_interface.answer("question", k=7)
 
-        vector_store.get_retriever.assert_called_once_with(k=7)
+        vector_store.similarity_search.assert_called_once_with("question", k=7)
+
+    def test_reranker_overfetches_and_reorders(self, vector_store):
+        reranker = MagicMock()
+        candidates = _make_docs(["a", "b", "c", "d", "e"])
+        vector_store.similarity_search.return_value = candidates
+        reranker.rerank.return_value = [candidates[3], candidates[0]]
+
+        with patch("src.llm_interface.ChatOpenAI"):
+            iface = LLMInterface(
+                vector_store=vector_store,
+                api_key="k",
+                reranker=reranker,
+                rerank_fetch_multiplier=3,
+            )
+        iface._llm = MagicMock()
+        iface._llm.invoke.return_value = MagicMock(content="ok")
+
+        result = iface.answer("q", k=2)
+
+        # Over-fetched k * multiplier = 6 candidates from FAISS.
+        vector_store.similarity_search.assert_called_once_with("q", k=6)
+        # Reranker received those candidates, top_k=2.
+        reranker.rerank.assert_called_once_with("q", candidates, top_k=2)
+        assert result["source_documents"] == [candidates[3], candidates[0]]
 
 
 # ---------------------------------------------------------------------------

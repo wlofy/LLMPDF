@@ -1,33 +1,37 @@
 #!/usr/bin/env python3
-"""LLMPDF – Command-line interface for the LLM-based PDF reader.
+"""LLMPDF – Command-line interface for the multi-source RAG knowledge base.
 
-Usage examples
---------------
-Index a PDF and ask a question:
+Examples
+--------
+Index a PDF and save the index:
     python main.py index document.pdf --save ./my_index
-    python main.py ask "What are the main conclusions?" --load ./my_index
 
-Summarize an entire document:
-    python main.py summarize document.pdf
+Ingest multiple sources at once:
+    python main.py ingest --pdf paper.pdf --md ./notes --sql sqlite:///data.db --sql-table articles --save ./kb
 
-Summarize a single page (0-based):
-    python main.py summarize document.pdf --page 0
+Ask a question (with cross-encoder reranking):
+    python main.py ask "What did the paper conclude?" --load ./kb --rerank
 
-Perform semantic search:
-    python main.py search "machine learning" document.pdf --top-k 3
+Run the retrieval eval:
+    python main.py eval examples/eval_dataset.json --load ./kb
 """
 
 import argparse
 import sys
+from typing import Optional
 
 from src.config import Config
+from src.knowledge_base import KnowledgeBase
 from src.pdf_reader import PDFReader
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="llmpdf",
-        description="LLM-based PDF reader – extract, search, and summarize PDF documents.",
+        description=(
+            "Multi-source RAG knowledge base: PDFs, markdown notes, and SQL, "
+            "with optional cross-encoder reranking."
+        ),
     )
     parser.add_argument(
         "--api-key",
@@ -42,69 +46,111 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # ------------------------------------------------------------------ index
-    p_index = sub.add_parser("index", help="Index a PDF file for later querying.")
+    # ---------------------------------------------------------------- index
+    p_index = sub.add_parser(
+        "index", help="Index a single PDF file (legacy convenience command)."
+    )
     p_index.add_argument("pdf", help="Path to the PDF file.")
-    p_index.add_argument(
-        "--save",
-        metavar="DIR",
-        help="Directory where the vector index will be saved.",
-    )
+    p_index.add_argument("--save", metavar="DIR", help="Where to save the index.")
 
-    # ------------------------------------------------------------------- ask
-    p_ask = sub.add_parser("ask", help="Ask a question about an indexed PDF.")
+    # --------------------------------------------------------------- ingest
+    p_ing = sub.add_parser(
+        "ingest", help="Ingest one or more sources into a single knowledge base."
+    )
+    p_ing.add_argument(
+        "--pdf", action="append", default=[], help="PDF file (repeatable)."
+    )
+    p_ing.add_argument(
+        "--md",
+        action="append",
+        default=[],
+        help="Markdown file or directory (repeatable).",
+    )
+    p_ing.add_argument(
+        "--sql",
+        help="SQLAlchemy connection URL, e.g. sqlite:///data.db",
+    )
+    p_ing.add_argument("--sql-table", help="Table name to ingest.")
+    p_ing.add_argument("--sql-query", help="Custom SELECT query to ingest.")
+    p_ing.add_argument(
+        "--sql-id-column", help="Column to record as row_id in metadata."
+    )
+    p_ing.add_argument(
+        "--sql-row-limit", type=int, help="Maximum rows to ingest."
+    )
+    p_ing.add_argument("--save", metavar="DIR", help="Where to save the index.")
+
+    # ------------------------------------------------------------------ ask
+    p_ask = sub.add_parser("ask", help="Ask a question against an indexed KB.")
     p_ask.add_argument("question", help="Question to ask.")
-    p_ask.add_argument("--pdf", help="PDF file to index before asking.")
+    p_ask.add_argument("--pdf", help="One-shot: ingest this PDF before asking.")
     p_ask.add_argument(
-        "--load",
-        metavar="DIR",
-        help="Load a previously saved vector index from this directory.",
+        "--load", metavar="DIR", help="Load a saved index from this directory."
     )
     p_ask.add_argument(
-        "--sources",
+        "--sources", action="store_true", help="Print the source chunks used."
+    )
+    p_ask.add_argument(
+        "--rerank",
         action="store_true",
-        help="Show the source document chunks used to generate the answer.",
+        help="Apply cross-encoder reranking to retrieved candidates.",
     )
     p_ask.add_argument(
         "--top-k",
         type=int,
         default=Config.SEARCH_TOP_K,
-        help="Number of context chunks to retrieve (default: %(default)s).",
+        help="Number of context chunks (default: %(default)s).",
     )
 
-    # --------------------------------------------------------------- summarize
+    # ------------------------------------------------------------- summarize
     p_sum = sub.add_parser("summarize", help="Summarize a PDF document.")
     p_sum.add_argument("pdf", help="Path to the PDF file.")
     p_sum.add_argument(
-        "--page",
-        type=int,
-        default=None,
-        metavar="N",
-        help="Summarize only page N (0-based index).",
+        "--page", type=int, default=None, metavar="N", help="Page (0-based) to summarize."
     )
 
     # ----------------------------------------------------------------- search
-    p_search = sub.add_parser(
-        "search", help="Perform semantic search over a PDF document."
-    )
+    p_search = sub.add_parser("search", help="Semantic search over the KB.")
     p_search.add_argument("query", help="Search query.")
-    p_search.add_argument("pdf", help="Path to the PDF file.")
+    p_search.add_argument("pdf", nargs="?", help="PDF to index on the fly.")
+    p_search.add_argument(
+        "--load", metavar="DIR", help="Load a saved index from this directory."
+    )
+    p_search.add_argument(
+        "--rerank", action="store_true", help="Apply cross-encoder reranking."
+    )
     p_search.add_argument(
         "--top-k",
         type=int,
         default=Config.SEARCH_TOP_K,
-        help="Number of results to return (default: %(default)s).",
+        help="Number of results (default: %(default)s).",
     )
-    p_search.add_argument(
-        "--load",
-        metavar="DIR",
-        help="Load a previously saved vector index from this directory.",
+
+    # ------------------------------------------------------------------- eval
+    p_eval = sub.add_parser(
+        "eval",
+        help="Evaluate retrieval quality (with and without reranking).",
+    )
+    p_eval.add_argument("dataset", help="Path to a JSON eval dataset.")
+    p_eval.add_argument(
+        "--load", metavar="DIR", help="Load a saved index from this directory."
+    )
+    p_eval.add_argument(
+        "--top-k",
+        type=int,
+        default=Config.SEARCH_TOP_K,
+        help="Top-k for hit@k (default: %(default)s).",
     )
 
     return parser
 
 
-def _require_api_key(api_key: str) -> None:
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _require_api_key(api_key: Optional[str]) -> None:
     if not api_key:
         print(
             "Error: OpenAI API key is required. "
@@ -112,6 +158,23 @@ def _require_api_key(api_key: str) -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+
+
+def _print_sources(sources) -> None:
+    print("Sources:")
+    for i, src in enumerate(sources, 1):
+        meta = src["metadata"]
+        label = meta.get("source", "?")
+        page = meta.get("page")
+        extra = f" (page {page})" if page is not None else ""
+        print(f"  [{i}] {label}{extra}")
+        snippet = src["content"][:200].strip().replace("\n", " ")
+        print(f"      {snippet} …")
+
+
+# ---------------------------------------------------------------------------
+# Command handlers
+# ---------------------------------------------------------------------------
 
 
 def cmd_index(args: argparse.Namespace) -> None:
@@ -125,36 +188,69 @@ def cmd_index(args: argparse.Namespace) -> None:
         print(f"✓ Index saved to {args.save}.")
 
 
+def cmd_ingest(args: argparse.Namespace) -> None:
+    _require_api_key(args.api_key)
+    if not (args.pdf or args.md or args.sql):
+        print("Error: provide at least one of --pdf, --md, --sql.", file=sys.stderr)
+        sys.exit(1)
+
+    kb = KnowledgeBase(api_key=args.api_key, model=args.model)
+    total = 0
+
+    for pdf_path in args.pdf:
+        print(f"Ingesting PDF: {pdf_path}")
+        total += kb.add_pdf(pdf_path)
+
+    for md_path in args.md:
+        print(f"Ingesting Markdown: {md_path}")
+        total += kb.add_markdown(md_path)
+
+    if args.sql:
+        if not (args.sql_table or args.sql_query):
+            print(
+                "Error: --sql requires --sql-table or --sql-query.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(f"Ingesting SQL: {args.sql}")
+        total += kb.add_sql(
+            connection_url=args.sql,
+            table=args.sql_table,
+            query=args.sql_query,
+            id_column=args.sql_id_column,
+            row_limit=args.sql_row_limit,
+        )
+
+    print(f"✓ Total chunks indexed: {total}")
+    if args.save:
+        kb.save_index(args.save)
+        print(f"✓ Index saved to {args.save}.")
+
+
 def cmd_ask(args: argparse.Namespace) -> None:
     _require_api_key(args.api_key)
-    reader = PDFReader(api_key=args.api_key, model=args.model)
+    kb = KnowledgeBase(
+        api_key=args.api_key, model=args.model, use_reranker=args.rerank
+    )
 
     if args.load:
         print(f"Loading index from {args.load} …")
-        reader.load_index(args.load)
+        kb.load_index(args.load)
     elif args.pdf:
         print(f"Indexing {args.pdf} …")
-        reader.index(args.pdf)
+        kb.add_pdf(args.pdf)
     else:
         print(
-            "Error: provide either --pdf to index a document or "
-            "--load to load an existing index.",
-            file=sys.stderr,
+            "Error: provide either --pdf or --load.", file=sys.stderr
         )
         sys.exit(1)
 
     if args.sources:
-        result = reader.ask_with_sources(args.question, k=args.top_k)
+        result = kb.ask_with_sources(args.question, k=args.top_k)
         print(f"\nAnswer:\n{result['answer']}\n")
-        print("Sources:")
-        for i, src in enumerate(result["sources"], 1):
-            meta = src["metadata"]
-            page = meta.get("page", "?")
-            source = meta.get("source", "")
-            print(f"  [{i}] Page {page} — {source}")
-            print(f"      {src['content'][:200].strip()} …")
+        _print_sources(result["sources"])
     else:
-        answer = reader.ask(args.question, k=args.top_k)
+        answer = kb.ask(args.question, k=args.top_k)
         print(f"\nAnswer:\n{answer}")
 
 
@@ -176,24 +272,42 @@ def cmd_summarize(args: argparse.Namespace) -> None:
 
 def cmd_search(args: argparse.Namespace) -> None:
     _require_api_key(args.api_key)
-    reader = PDFReader(api_key=args.api_key, model=args.model)
+    kb = KnowledgeBase(
+        api_key=args.api_key, model=args.model, use_reranker=args.rerank
+    )
 
     if args.load:
         print(f"Loading index from {args.load} …")
-        reader.load_index(args.load)
-    else:
+        kb.load_index(args.load)
+    elif args.pdf:
         print(f"Indexing {args.pdf} …")
-        reader.index(args.pdf)
+        kb.add_pdf(args.pdf)
+    else:
+        print("Error: provide either a PDF path or --load.", file=sys.stderr)
+        sys.exit(1)
 
     print(f"\nSearching for: '{args.query}'\n")
-    results = reader.search(args.query, k=args.top_k)
+    results = kb.search(args.query, k=args.top_k)
     for i, result in enumerate(results, 1):
         meta = result["metadata"]
-        page = meta.get("page", "?")
-        source = meta.get("source", "")
+        label = meta.get("source", "?")
+        page = meta.get("page")
         score = result["score"]
-        print(f"[{i}] Page {page} — {source}  (score: {score:.4f})")
+        extra = f" page {page}" if page is not None else ""
+        print(f"[{i}] {label}{extra}  (score: {score:.4f})")
         print(f"    {result['content'][:300].strip()}\n")
+
+
+def cmd_eval(args: argparse.Namespace) -> None:
+    _require_api_key(args.api_key)
+    from src.eval import run_eval
+
+    run_eval(
+        dataset_path=args.dataset,
+        index_dir=args.load,
+        api_key=args.api_key,
+        top_k=args.top_k,
+    )
 
 
 def main() -> None:
@@ -202,9 +316,11 @@ def main() -> None:
 
     handlers = {
         "index": cmd_index,
+        "ingest": cmd_ingest,
         "ask": cmd_ask,
         "summarize": cmd_summarize,
         "search": cmd_search,
+        "eval": cmd_eval,
     }
     handlers[args.command](args)
 

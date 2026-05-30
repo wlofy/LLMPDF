@@ -1,14 +1,18 @@
-"""LLM interface: Q&A and summarization over indexed PDF content."""
+"""LLM interface: Q&A and summarization over indexed content.
+
+Supports optional cross-encoder reranking: FAISS over-fetches a candidate
+pool, the reranker reorders it, and the top-k context goes to the LLM.
+"""
 
 from typing import Any, Dict, List, Optional
 
-from langchain_classic.chains import RetrievalQA
 from langchain_classic.chains.summarize import load_summarize_chain
 from langchain_core.documents import Document
 from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
 
 from .config import Config
+from .reranker import CrossEncoderReranker
 from .vector_store import VectorStore
 
 # ---------------------------------------------------------------------------
@@ -16,7 +20,7 @@ from .vector_store import VectorStore
 # ---------------------------------------------------------------------------
 
 _QA_PROMPT_TEMPLATE = """You are a knowledgeable assistant that answers questions
-based strictly on the provided PDF content.
+based strictly on the provided context drawn from the user's knowledge base.
 
 Context:
 {context}
@@ -25,7 +29,7 @@ Question: {question}
 
 Provide a clear, concise answer using only information from the context above.
 If the answer is not found in the context, say "I don't have enough information
-in the document to answer that question."
+in the knowledge base to answer that question."
 """
 
 _QA_PROMPT = PromptTemplate(
@@ -58,13 +62,35 @@ class LLMInterface:
         vector_store: VectorStore,
         api_key: Optional[str] = None,
         model: str = Config.OPENAI_MODEL,
+        reranker: Optional[CrossEncoderReranker] = None,
+        rerank_fetch_multiplier: int = Config.RERANK_FETCH_MULTIPLIER,
     ):
         self._vector_store = vector_store
+        self._reranker = reranker
+        self._rerank_fetch_multiplier = max(1, rerank_fetch_multiplier)
         self._llm = ChatOpenAI(
             model=model,
             temperature=0,
             openai_api_key=api_key or Config.OPENAI_API_KEY,
         )
+
+    # ------------------------------------------------------------------
+    # Retrieval (with optional reranking)
+    # ------------------------------------------------------------------
+
+    def retrieve(self, query: str, k: int = Config.SEARCH_TOP_K) -> List[Document]:
+        """Retrieve top-k context chunks, applying the reranker if configured."""
+        if not self._vector_store.is_ready:
+            raise RuntimeError(
+                "Vector store is not initialised. Index a source first."
+            )
+
+        if self._reranker is None:
+            return self._vector_store.similarity_search(query, k=k)
+
+        fetch_k = k * self._rerank_fetch_multiplier
+        candidates = self._vector_store.similarity_search(query, k=fetch_k)
+        return self._reranker.rerank(query, candidates, top_k=k)
 
     # ------------------------------------------------------------------
     # Question answering
@@ -73,32 +99,18 @@ class LLMInterface:
     def answer(self, question: str, k: int = Config.SEARCH_TOP_K) -> Dict[str, Any]:
         """Answer a question using context retrieved from the vector store.
 
-        Args:
-            question: Natural-language question about the PDF content.
-            k: Number of chunks to retrieve as context.
+        Uses :meth:`retrieve` so reranking (when configured) is applied
+        before the context is stuffed into the prompt.
 
         Returns:
-            Dictionary with keys:
-              - ``result``: The generated answer string.
-              - ``source_documents``: List of Document objects used as context.
-
-        Raises:
-            RuntimeError: If the vector store is not ready.
+            Dict with ``result`` (answer text) and ``source_documents``.
         """
-        if not self._vector_store.is_ready:
-            raise RuntimeError(
-                "Vector store is not initialised. Index a PDF first."
-            )
-
-        retriever = self._vector_store.get_retriever(k=k)
-        chain = RetrievalQA.from_chain_type(
-            llm=self._llm,
-            chain_type="stuff",
-            retriever=retriever,
-            return_source_documents=True,
-            chain_type_kwargs={"prompt": _QA_PROMPT},
-        )
-        return chain.invoke({"query": question})
+        docs = self.retrieve(question, k=k)
+        context = "\n\n".join(d.page_content for d in docs)
+        prompt = _QA_PROMPT.format(context=context, question=question)
+        response = self._llm.invoke(prompt)
+        answer_text = getattr(response, "content", str(response))
+        return {"result": answer_text, "source_documents": docs}
 
     # ------------------------------------------------------------------
     # Summarization
@@ -138,30 +150,37 @@ class LLMInterface:
     def search(self, query: str, k: int = Config.SEARCH_TOP_K) -> List[Dict[str, Any]]:
         """Perform semantic search and return ranked results with scores.
 
-        Args:
-            query: Natural-language search query.
-            k: Number of results to return.
+        When a reranker is configured, results are over-fetched from FAISS
+        and reordered by cross-encoder relevance. The ``score`` field is the
+        cross-encoder score in that case, otherwise the FAISS L2 distance.
 
         Returns:
-            List of dicts, each containing:
-              - ``content``: The matching text chunk.
-              - ``score``: Similarity score (lower is more similar for L2).
-              - ``metadata``: Source metadata (page number, file, etc.).
-
-        Raises:
-            RuntimeError: If the vector store is not ready.
+            List of dicts with ``content``, ``score``, and ``metadata``.
         """
         if not self._vector_store.is_ready:
             raise RuntimeError(
-                "Vector store is not initialised. Index a PDF first."
+                "Vector store is not initialised. Index a source first."
             )
 
-        results = self._vector_store.similarity_search_with_score(query, k=k)
+        if self._reranker is None:
+            results = self._vector_store.similarity_search_with_score(query, k=k)
+            return [
+                {
+                    "content": doc.page_content,
+                    "score": float(score),
+                    "metadata": doc.metadata,
+                }
+                for doc, score in results
+            ]
+
+        fetch_k = k * self._rerank_fetch_multiplier
+        candidates = self._vector_store.similarity_search(query, k=fetch_k)
+        scored = self._reranker.rerank_with_scores(query, candidates)[:k]
         return [
             {
                 "content": doc.page_content,
                 "score": float(score),
                 "metadata": doc.metadata,
             }
-            for doc, score in results
+            for doc, score in scored
         ]

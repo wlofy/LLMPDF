@@ -1,0 +1,22 @@
+[
+  {
+    "question": "What is FAISS used for?",
+    "keywords": ["FAISS", "vector", "similarity"]
+  },
+  {
+    "question": "How are PDFs chunked before embedding?",
+    "keywords": ["chunk", "split", "RecursiveCharacterTextSplitter"]
+  },
+  {
+    "question": "Which embedding model does the project use by default?",
+    "keywords": ["text-embedding-ada-002", "OpenAIEmbeddings"]
+  },
+  {
+    "question": "What is the default chunk size?",
+    "keywords": ["1000", "CHUNK_SIZE"]
+  },
+  {
+    "question": "How can a saved index be reloaded from disk?",
+    "keywords": ["load_local", "load_index", "FAISS.load"]
+  }
+]

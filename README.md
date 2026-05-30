@@ -1,14 +1,17 @@
 # LLMPDF
 
-A LLM-based PDF semantic meaning extractor that extracts, processes, and queries information from PDF documents. It comes with intelligent search and summarization powered by large language models.
+A multi-source RAG knowledge base. Ingest PDFs, markdown notes, and SQL rows
+into a single FAISS index, then ask questions with optional cross-encoder
+reranking for higher retrieval precision.
 
 ## Features
 
-- **Extract** – Load and parse multi-page PDF files
-- **Semantic search** – Find relevant passages using vector embeddings (FAISS)
-- **Question answering** – Ask natural-language questions and receive grounded answers with source citations
-- **Summarization** – Summarize entire documents or individual pages using a map-reduce LLM chain
-- **Persistent index** – Save and reload the FAISS vector index to avoid re-embedding large documents
+- **Multi-source ingestion** — PDFs, markdown/text directories, and SQL tables or queries (SQLAlchemy)
+- **Semantic search** — FAISS vector store backed by OpenAI embeddings
+- **Cross-encoder reranking** — local `ms-marco-MiniLM` reranker (sentence-transformers) reorders FAISS candidates for higher precision; no external API needed
+- **Question answering** — grounded answers with source citations
+- **Summarization** — map-reduce summarization for PDFs
+- **Retrieval evaluation** — `hit@k` harness compares baseline FAISS vs. reranked retrieval
 
 ## Project Structure
 
@@ -16,19 +19,19 @@ A LLM-based PDF semantic meaning extractor that extracts, processes, and queries
 LLMPDF/
 ├── main.py                 # CLI entry point
 ├── requirements.txt
-├── .env.example
+├── examples/
+│   └── eval_dataset.json   # Sample retrieval eval set
 ├── src/
-│   ├── __init__.py
-│   ├── config.py           # Configuration (env vars)
-│   ├── pdf_processor.py    # PDF loading & chunking
+│   ├── config.py           # Env-driven configuration
+│   ├── loaders.py          # PDF / Markdown / SQL loaders
+│   ├── pdf_processor.py    # PDF loader + chunker (legacy)
 │   ├── vector_store.py     # FAISS vector store
-│   ├── llm_interface.py    # Q&A, summarization, search
-│   └── pdf_reader.py       # High-level façade
+│   ├── reranker.py         # CrossEncoderReranker
+│   ├── llm_interface.py    # Retrieval, reranking, Q&A, summarization
+│   ├── knowledge_base.py   # Multi-source facade (new primary entry point)
+│   ├── pdf_reader.py       # PDF-only facade (kept for backward compat)
+│   └── eval.py             # Retrieval eval harness
 └── tests/
-    ├── test_pdf_processor.py
-    ├── test_vector_store.py
-    ├── test_llm_interface.py
-    └── test_pdf_reader.py
 ```
 
 ## Requirements
@@ -40,81 +43,104 @@ LLMPDF/
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env
-# Edit .env and set OPENAI_API_KEY=sk-...
+cp .env.example .env  # then set OPENAI_API_KEY=sk-...
 ```
+
+The first run with `--rerank` downloads the cross-encoder model (~90 MB) and
+caches it locally.
 
 ## CLI Usage
 
-### Index a PDF
+### Single PDF (legacy)
 
 ```bash
 python main.py index document.pdf --save ./my_index
-```
-
-### Ask a question
-
-```bash
-# From a saved index:
 python main.py ask "What are the main conclusions?" --load ./my_index
-
-# Index on the fly:
-python main.py ask "What are the main conclusions?" --pdf document.pdf
-
-# Show source chunks:
-python main.py ask "What is the methodology?" --pdf document.pdf --sources
 ```
 
-### Summarize
+### Multi-source ingestion
 
 ```bash
-# Entire document:
-python main.py summarize document.pdf
-
-# Single page (0-based):
-python main.py summarize document.pdf --page 0
+python main.py ingest \
+    --pdf paper.pdf \
+    --md ./notes \
+    --sql sqlite:///data.db --sql-table articles --sql-id-column id \
+    --save ./kb
 ```
+
+`--pdf` and `--md` are repeatable. `--sql` accepts a SQLAlchemy URL plus
+either `--sql-table` or `--sql-query`.
+
+### Ask a question (with reranking)
+
+```bash
+python main.py ask "What did the paper conclude about X?" \
+    --load ./kb --rerank --sources
+```
+
+`--rerank` over-fetches `top_k * RERANK_FETCH_MULTIPLIER` candidates from
+FAISS, scores them with the cross-encoder, and returns the best `top_k`.
 
 ### Semantic search
 
 ```bash
-python main.py search "neural networks" document.pdf --top-k 3
+python main.py search "vector similarity" --load ./kb --rerank --top-k 5
 ```
+
+### Retrieval evaluation
+
+```bash
+python main.py eval examples/eval_dataset.json --load ./kb --top-k 5
+```
+
+Runs the eval twice (baseline FAISS only, then with reranking) and prints
+`hit@1`, `hit@3`, `hit@k` plus the delta. Dataset format:
+
+```json
+[
+  {
+    "question": "What is FAISS used for?",
+    "keywords": ["FAISS", "vector"],
+    "source_contains": "vector_store"
+  }
+]
+```
+
+A retrieved chunk counts as a hit if it matches all provided constraints.
 
 ## Python API
 
 ```python
-from src.pdf_reader import PDFReader
+from src.knowledge_base import KnowledgeBase
 
-reader = PDFReader(api_key="sk-...")
+kb = KnowledgeBase(api_key="sk-...", use_reranker=True)
 
-# Index a PDF (returns number of chunks)
-n = reader.index("document.pdf")
+kb.add_pdf("paper.pdf")
+kb.add_markdown("./notes", recursive=True)
+kb.add_sql(
+    "sqlite:///data.db",
+    table="articles",
+    id_column="id",
+    row_limit=10_000,
+)
 
-# Ask a question
-answer = reader.ask("What is the main topic?")
+print(kb.ask("What does the paper say about RAG?"))
 
-# Ask with source citations
-result = reader.ask_with_sources("What methodology was used?")
+result = kb.ask_with_sources("What methodology was used?")
 print(result["answer"])
 for src in result["sources"]:
     print(src["metadata"], src["content"][:200])
 
-# Summarize
-summary = reader.summarize()
-
-# Summarize a specific page
-page_summary = reader.summarize_page(0)
-
-# Semantic search
-results = reader.search("deep learning", k=5)
+results = kb.search("vector similarity", k=5)
 for r in results:
     print(r["score"], r["content"][:100])
 
-# Save / load index
-reader.save_index("./my_index")
-reader.load_index("./my_index")
+kb.save_index("./kb")
+kb.load_index("./kb")
 ```
+
+The legacy single-PDF `PDFReader` is still available for backward
+compatibility — see `src/pdf_reader.py`.
 
 ## Running Tests
 
@@ -125,13 +151,15 @@ python -m pytest tests/ -v
 
 ## Configuration
 
-All settings can be overridden via environment variables (see `.env.example`):
+All settings can be overridden via environment variables:
 
 | Variable | Default | Description |
 |---|---|---|
-| `OPENAI_API_KEY` | *(required)* | Your OpenAI API key |
-| `OPENAI_MODEL` | `gpt-3.5-turbo` | Chat model for Q&A and summarization |
+| `OPENAI_API_KEY` | *(required)* | OpenAI API key |
+| `OPENAI_MODEL` | `gpt-3.5-turbo` | Chat model for Q&A |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-ada-002` | Embedding model |
-| `CHUNK_SIZE` | `1000` | Characters per text chunk |
-| `CHUNK_OVERLAP` | `200` | Overlap between consecutive chunks |
-| `SEARCH_TOP_K` | `5` | Default number of search results |
+| `CHUNK_SIZE` | `1000` | Characters per chunk |
+| `CHUNK_OVERLAP` | `200` | Overlap between chunks |
+| `SEARCH_TOP_K` | `5` | Default top-k for retrieval |
+| `RERANKER_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Cross-encoder model |
+| `RERANK_FETCH_MULTIPLIER` | `5` | Candidates fetched = top_k × this |
